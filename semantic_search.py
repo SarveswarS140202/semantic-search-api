@@ -2,13 +2,11 @@ import time
 import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
 
 app = FastAPI()
 
-# Load local embedding model (downloads once)
-model = SentenceTransformer("all-MiniLM-L6-v2")
+client = OpenAI()
 
 # Load documents
 documents = []
@@ -22,15 +20,15 @@ with open("abstracts.txt", "r", encoding="utf-8") as f:
 
 doc_texts = [doc["content"] for doc in documents]
 
-# Compute embeddings once
-doc_embeddings = model.encode(doc_texts)
+def embed_texts(texts):
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
+    return np.array([r.embedding for r in response.data])
 
-class SearchRequest(BaseModel):
-    query: str
-    k: int = 8
-    rerank: bool = True
-    rerankK: int = 5
-
+# Compute embeddings once at startup
+doc_embeddings = embed_texts(doc_texts)
 
 def normalize_scores(scores):
     min_s = np.min(scores)
@@ -39,20 +37,11 @@ def normalize_scores(scores):
         return np.ones_like(scores) * 0.5
     return (scores - min_s) / (max_s - min_s)
 
-
-def rerank(query, candidates):
-    query_embedding = model.encode([query])
-    candidate_texts = [c["content"] for c in candidates]
-    candidate_embeddings = model.encode(candidate_texts)
-
-    scores = cosine_similarity(query_embedding, candidate_embeddings)[0]
-    scores = normalize_scores(scores)
-
-    for c, score in zip(candidates, scores):
-        c["score"] = float(score)
-
-    return sorted(candidates, key=lambda x: x["score"], reverse=True)
-
+class SearchRequest(BaseModel):
+    query: str
+    k: int = 8
+    rerank: bool = True
+    rerankK: int = 5
 
 @app.post("/search")
 def search(req: SearchRequest):
@@ -66,10 +55,16 @@ def search(req: SearchRequest):
             "metrics": {"latency": 0, "totalDocs": len(documents)}
         }
 
-    query_embedding = model.encode([req.query])
-    similarities = cosine_similarity(query_embedding, doc_embeddings)[0]
+    query_embedding = embed_texts([req.query])[0]
 
-    similarities = normalize_scores(similarities)
+    similarities = []
+    for emb in doc_embeddings:
+        score = np.dot(query_embedding, emb) / (
+            np.linalg.norm(query_embedding) * np.linalg.norm(emb)
+        )
+        similarities.append(score)
+
+    similarities = normalize_scores(np.array(similarities))
 
     top_indices = np.argsort(similarities)[::-1][:req.k]
 
@@ -82,20 +77,13 @@ def search(req: SearchRequest):
             "metadata": documents[idx]["metadata"]
         })
 
-    reranked_flag = False
-
-    if req.rerank and len(candidates) > 0:
-        candidates = rerank(req.query, candidates)
-        candidates = candidates[:req.rerankK]
-        reranked_flag = True
-    else:
-        candidates = candidates[:req.rerankK]
+    candidates = candidates[:req.rerankK]
 
     latency = int((time.time() - start_time) * 1000)
 
     return {
         "results": candidates,
-        "reranked": reranked_flag,
+        "reranked": False,
         "metrics": {
             "latency": latency,
             "totalDocs": len(documents)
