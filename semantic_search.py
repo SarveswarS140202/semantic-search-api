@@ -1,12 +1,14 @@
 import time
+import os
 import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI()
-
 client = OpenAI()
+
+EMBEDDINGS_FILE = "doc_embeddings.npy"
 
 # Load documents
 documents = []
@@ -27,8 +29,15 @@ def embed_texts(texts):
     )
     return np.array([r.embedding for r in response.data])
 
-# Compute embeddings once at startup
-doc_embeddings = embed_texts(doc_texts)
+# ---------- CACHE LOGIC ----------
+if os.path.exists(EMBEDDINGS_FILE):
+    print("Loading cached embeddings...")
+    doc_embeddings = np.load(EMBEDDINGS_FILE)
+else:
+    print("Computing embeddings for documents...")
+    doc_embeddings = embed_texts(doc_texts)
+    np.save(EMBEDDINGS_FILE, doc_embeddings)
+# ----------------------------------
 
 def normalize_scores(scores):
     min_s = np.min(scores)
